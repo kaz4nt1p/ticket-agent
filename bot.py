@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from openai_agent import extract_flight_query
 from datetime import datetime, timedelta
 import re
+from flight_cache import get_flight_from_cache, set_flight_to_cache
+from dialog_memory import save_message_to_memory, get_memory
 
 app = FastAPI()
 
@@ -15,12 +17,15 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 AVIASALES_TOKEN = os.getenv("AVIASALES_TOKEN")
 
-async def search_top_flights(origin: str, destination: str, date: str = None, currency: str = "rub") -> str:
+async def search_top_flights(origin: str, destination: str, date: str = None, currency: str = "rub", transfers: str = "any") -> str:
     url = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
     headers = {}
     all_flights = []
     # Обработка диапазона дат или списка дат
     date_list = []
+    # --- Исправление: поддержка dict для диапазона дат ---
+    if isinstance(date, dict) and "from" in date and "to" in date:
+        date = f"{date['from']} - {date['to']}"
     if date and date != "any":
         # Диапазон дат: 2025-08-07 - 2025-08-10
         match = re.match(r"(\d{4}-\d{2}-\d{2})\s*-\s*(\d{4}-\d{2}-\d{2})", date)
@@ -51,17 +56,57 @@ async def search_top_flights(origin: str, destination: str, date: str = None, cu
         }
         if d:
             params["departure_at"] = d
+        # Добавляем direct=true, если нужны только прямые рейсы
+        if transfers == 0 or transfers == "0":
+            params["direct"] = "true"
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(url, params=params, headers=headers)
                 data = resp.json()
-                print(f"[AVIASALES] Response for {d}:", data)
+                # Логируем только найденные рейсы по направлению Москва–Нячанг
+                if origin == "MOW" and destination == "NHA":
+                    print(f"[DEBUG] Aviasales raw data for {d}: {data.get('data')}")
+                # Убираем неинформативный огромный лог
+                # print(f"[AVIASALES] Response for {d}:", data)
                 if data.get("success") and data.get("data"):
                     all_flights.extend(data["data"])
         except Exception as e:
             print(f"[ERROR] Ошибка при поиске билетов на дату {d}: {e}")
     if not all_flights:
         return "Билеты не найдены."
+    # --- Новая логика фильтрации по пересадкам ---
+    original_flights = all_flights.copy()
+    if transfers == 0 or transfers == "0":
+        all_flights = [f for f in all_flights if f.get("transfers", 0) == 0]
+        if not all_flights:
+            # Нет прямых рейсов, но есть с пересадками
+            if original_flights:
+                # Показываем варианты с пересадками с явным предупреждением
+                # Оставляем только уникальные рейсы по дате
+                seen = set()
+                unique_flights = []
+                for f in original_flights:
+                    key = (f.get("departure_at"), f.get("origin"), f.get("destination"))
+                    if key not in seen:
+                        seen.add(key)
+                        unique_flights.append(f)
+                unique_flights.sort(key=lambda x: x.get("price", 999999))
+                flights = unique_flights[:5]
+                result = ["Прямых рейсов не найдено на выбранные даты, вот варианты с пересадками:"]
+                for idx, flight in enumerate(flights, 1):
+                    price = flight.get("price")
+                    airline = flight.get("airline", "-")
+                    depart = flight.get("departure_at", "-")[:10]
+                    origin_airport = flight.get("origin_airport", origin)
+                    dest_airport = flight.get("destination_airport", destination)
+                    link = flight.get("link", "")
+                    transfers = flight.get("transfers", 0)
+                    result.append(
+                        f"{idx}. {origin} ({origin_airport}) - {destination} ({dest_airport}) от {price} {currency.upper()} (https://www.aviasales.com{link})\n- Дата вылета: {depart} и другие.\n- {airline}, {transfers} пересадки\n- Сравнить цены: Trip.com (https://l.katus.ai/cRCYBF)\n"
+                    )
+                return "\n".join(result)
+            else:
+                return "Билеты не найдены."
     # Оставляем только уникальные рейсы по дате
     seen = set()
     unique_flights = []
@@ -114,6 +159,8 @@ async def get_iata_code(city_name: str) -> Tuple[Optional[str], Optional[str], O
         print(f"[IATA ERROR] {e}")
     return None, None, None
 
+# SYSTEM_PROMPT: Сначала вызывай flight_cache. Если вернулся null — AviasalesSearchTool, потом flight_cache с новым списком.
+
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     try:
@@ -122,13 +169,24 @@ async def telegram_webhook(request: Request):
         chat_id = data.get("message", {}).get("chat", {}).get("id")
         text = data.get("message", {}).get("text", "")
         if chat_id and text:
+            # Сохраняем сообщение пользователя в память (контекст)
+            save_message_to_memory(chat_id, text, k=10)
+            # Получаем историю для передачи в LLM (без текущего сообщения):
+            history = get_memory(chat_id, k=10)[:-1] if get_memory(chat_id, k=10) else []
             # --- Новый универсальный режим: обработка любого текста через OpenAI-агента ---
-            parsed = await extract_flight_query(text)
-            origin_city = parsed.get("from", "any").lower()
-            dest_city = parsed.get("to", "any").lower()
-            date = parsed.get("date", "any")
-            if origin_city == "any" or dest_city == "any":
-                await send_message(chat_id, "Пожалуйста, укажите город вылета и назначения.")
+            parsed = await extract_flight_query(text, history=history)
+            origin_city = parsed.get("from")
+            dest_city = parsed.get("to")
+            date = parsed.get("date")
+            transfers = parsed.get("transfers", "any")
+            # Если хотя бы один из параметров не определён — уточняем только его
+            missing = []
+            if not origin_city or origin_city == "any":
+                missing.append("город вылета")
+            if not dest_city or dest_city == "any":
+                missing.append("город назначения")
+            if missing:
+                await send_message(chat_id, f"Пожалуйста, укажите: {', '.join(missing)}.")
                 return {"ok": True}
             # --- Автоматическое определение IATA ---
             origin = None
@@ -136,20 +194,21 @@ async def telegram_webhook(request: Request):
             origin_country = None
             if not origin:
                 origin, origin_name, origin_country = await get_iata_code(origin_city)
-                if origin:
-                    await send_message(chat_id, f"{origin_city.title()} — это {origin_name} ({origin}) в стране {origin_country}.")
             destination = None
             dest_name = dest_city
             dest_country = None
             if not destination:
                 destination, dest_name, dest_country = await get_iata_code(dest_city)
-                if destination:
-                    await send_message(chat_id, f"{dest_city.title()} — это {dest_name} ({destination}) в стране {dest_country}.")
+            reply = None
+            # --- Исправление: если дата не указана или any, не подставлять дату ---
+            date_param = date if (date and date != "any") else None
             if origin and destination:
-                reply = await search_top_flights(origin, destination, date)
+                reply = await search_top_flights(origin, destination, date_param, transfers=transfers)
+            if reply:
+                await send_message(chat_id, reply)
             else:
-                reply = "Не удалось определить IATA-код для одного из городов. Попробуйте другой город."
-            await send_message(chat_id, reply)
+                await send_message(chat_id, "Не удалось найти билеты по вашему запросу.")
+            return {"ok": True}
         else:
             print("[WEBHOOK] Нет chat_id или текста в сообщении")
     except Exception as e:

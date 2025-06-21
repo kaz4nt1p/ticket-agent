@@ -1,9 +1,11 @@
 from fastapi import FastAPI
 from models import MsgPayload
 from bot import app as telegram_app
+from webhook import router as webhook_router
 
 app = FastAPI()
 app.mount("/tg", telegram_app)
+app.include_router(webhook_router)
 messages_list: dict[int, MsgPayload] = {}
 
 
