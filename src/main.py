@@ -6,10 +6,14 @@ from dotenv import load_dotenv
 
 # Import from new structure
 from src.core.bot import app as bot_app
+from src.services.price_tracker_scheduler import start_scheduler
 
 load_dotenv()
 
 app = FastAPI(title="Flight Tracker Bot API", version="1.0.0")
+
+# Запуск шедулера при старте приложения
+start_scheduler()
 
 # Add CORS middleware
 app.add_middleware(

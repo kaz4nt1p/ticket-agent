@@ -10,6 +10,9 @@ import re
 from src.core.dialog_memory import save_message_to_memory, get_memory
 from src.core.conversation_state import get_conversation_state
 from src.services.flight_cache import flight_cache
+from src.services.price_tracker_db import add_tracked_flights
+import json
+from src.services.redis_client import redis_client
 
 app = APIRouter()
 
@@ -17,6 +20,9 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 AVIASALES_TOKEN = os.getenv("AVIASALES_TOKEN")
+
+# --- Сохраняем flights в Redis после отправки пользователю ---
+TRACK_FLIGHTS_KEY = "track_flights:{}"
 
 async def search_top_flights(origin: str, destination: str, date: Optional[Union[str, dict]] = None, currency: str = "rub", transfers: str = "any") -> str:
     # --- КЭШИРОВАНИЕ ---
@@ -130,26 +136,13 @@ async def search_top_flights(origin: str, destination: str, date: Optional[Union
                     dest_airport = flight.get("destination_airport", destination)
                     link = flight.get("link", "")
                     transfers_count = flight.get("transfers", 0)
-                    
-                    # Форматируем цену с разделителями
                     formatted_price = f"{price:,}".replace(",", " ")
-                    
-                    # Создаем красивую карточку рейса
-                    flight_card = f"🎫 {idx}. {airline}"
-                    flight_card += f"\n💰 {formatted_price} {currency.upper()}"
-                    flight_card += f"\n🛫 {origin} ({origin_airport}) → {destination} ({dest_airport})"
-                    flight_card += f"\n📅 {depart}"
-                    flight_card += f"\n🔄 {transfers_count} пересадка"
-                    
-                    # Добавляем короткую ссылку на Aviasales
                     aviasales_url = f"https://www.aviasales.com{link}"
-                    flight_card += f"\n🔗 [Купить билет]({aviasales_url})"
-                    
+                    flight_card = f"{idx}. {origin} ({origin_airport}) - {destination} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
+                    flight_card += f"\n- Дата вылета: {depart} и другие."
+                    flight_card += f"\n- {airline}, {transfers_count} пересадки" if transfers_count != 1 else f"\n- {airline}, 1 пересадка"
                     result.append(flight_card)
                     result.append("")  # Пустая строка между рейсами
-                
-                # Добавляем итоговую информацию
-                result.append("💡 Совет: Нажмите на ссылку для покупки билета")
                 
                 return "\n".join(result)
             else:
@@ -191,30 +184,13 @@ async def search_top_flights(origin: str, destination: str, date: Optional[Union
         dest_airport = flight.get("destination_airport", destination)
         link = flight.get("link", "")
         transfers_count = flight.get("transfers", 0)
-        
-        # Форматируем цену с разделителями
         formatted_price = f"{price:,}".replace(",", " ")
-        
-        # Создаем красивую карточку рейса
-        flight_card = f"🎫 {idx}. {airline}"
-        flight_card += f"\n💰 {formatted_price} {currency.upper()}"
-        flight_card += f"\n🛫 {origin} ({origin_airport}) → {destination} ({dest_airport})"
-        flight_card += f"\n📅 {depart}"
-        
-        if transfers_count == 0:
-            flight_card += "\n✅ Прямой рейс"
-        else:
-            flight_card += f"\n🔄 {transfers_count} пересадка"
-        
-        # Добавляем короткую ссылку на Aviasales
         aviasales_url = f"https://www.aviasales.com{link}"
-        flight_card += f"\n🔗 [Купить билет]({aviasales_url})"
-        
+        flight_card = f"{idx}. {origin} ({origin_airport}) - {destination} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
+        flight_card += f"\n- Дата вылета: {depart} и другие."
+        flight_card += f"\n- {airline}, {transfers_count} пересадки" if transfers_count != 1 else f"\n- {airline}, 1 пересадка"
         result.append(flight_card)
         result.append("")  # Пустая строка между рейсами
-    
-    # Добавляем итоговую информацию
-    result.append("💡 Совет: Нажмите на ссылку для покупки билета")
     
     return "\n".join(result)
 
@@ -252,6 +228,38 @@ async def telegram_webhook(request: Request):
     try:
         data = await request.json()
         print("[WEBHOOK] Incoming data:", data)
+        # --- Обработка callback-кнопки ---
+        if "callback_query" in data:
+            callback = data["callback_query"]
+            chat_id = callback["message"]["chat"]["id"]
+            message_id = callback["message"]["message_id"]
+            data_str = callback["data"]
+            if data_str == "track_price":
+                # Получаем flights из Redis
+                flights_json = redis_client.get(TRACK_FLIGHTS_KEY.format(chat_id))
+                if flights_json:
+                    flights = json.loads(flights_json)
+                    # Преобразуем flights к нужному формату для SQLite
+                    flights_for_db = []
+                    for f in flights:
+                        flights_for_db.append({
+                            "from_city": f.get("origin"),
+                            "to_city": f.get("destination"),
+                            "date": f.get("departure_at", "")[:10],
+                            "flight_number": f.get("flight_number", f.get("airline", "") + f.get("departure_at", "")),
+                            "airline": f.get("airline"),
+                            "departure_time": f.get("departure_at"),
+                            "arrival_time": f.get("return_at", ""),
+                            "transfers": f.get("transfers"),
+                            "current_price": f.get("price")
+                        })
+                    add_tracked_flights(chat_id, flights_for_db)
+                    await send_message(chat_id, "Вы подписались на уведомления о снижении цены по этим рейсам!")
+                else:
+                    await send_message(chat_id, "Не удалось найти рейсы для отслеживания. Попробуйте ещё раз.")
+                return {"ok": True}
+            return {"ok": True}
+        # --- Обычная логика обработки сообщений ---
         chat_id = data.get("message", {}).get("chat", {}).get("id")
         text = data.get("message", {}).get("text", "")
         if chat_id and text:
@@ -359,6 +367,7 @@ async def telegram_webhook(request: Request):
             
             # --- Поиск билетов ---
             reply = None
+            flights = []
             date_param = updated_state["date"] if updated_state["date"] else None
             transfers_param = str(updated_state["transfers"]) if updated_state["transfers"] is not None else "any"
             
@@ -382,11 +391,15 @@ async def telegram_webhook(request: Request):
                     print(f"[DATE RANGE] Converting single date to month range: {date_param}")
             
             if origin and destination:
-                reply = await search_top_flights(origin, destination, date_param, transfers=transfers_param)
+                flights, reply = await search_top_flights_with_flights(origin, destination, date_param, transfers=transfers_param)
             
             if reply:
-                await send_message(chat_id, reply)
-                # Очищаем состояние после успешного поиска
+                # Если есть рейсы, отправляем с кнопкой
+                if flights:
+                    redis_client.setex(TRACK_FLIGHTS_KEY.format(chat_id), 3600, json.dumps(flights, ensure_ascii=False))
+                    await send_message(chat_id, reply, reply_markup=get_price_track_button())
+                else:
+                    await send_message(chat_id, reply)  # reply всегда строка
                 conv_state.clear_state()
                 print("[CONVERSATION CLEARED] State cleared after successful search")
             else:
@@ -399,9 +412,170 @@ async def telegram_webhook(request: Request):
         print(f"[WEBHOOK ERROR] {e}")
     return {"ok": True}
 
-async def send_message(chat_id: int, text: str):
+async def send_message(chat_id: int, text: str, reply_markup: dict = None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient() as client:
         await client.post(
             TELEGRAM_API_URL,
-            json={"chat_id": chat_id, "text": text}
+            json=payload
         )
+
+# --- Новый хелпер для формирования inline-кнопки ---
+def get_price_track_button():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Сообщить о снижении цены 🔔", "callback_data": "track_price"}
+            ]
+        ]
+    }
+
+# --- Модифицируем search_top_flights для возврата списка рейсов и текста ---
+async def search_top_flights_with_flights(origin: str, destination: str, date: Optional[Union[str, dict]] = None, currency: str = "rub", transfers: str = "any") -> tuple:
+    params_for_cache = {
+        "origin": origin,
+        "destination": destination,
+        "date": date,
+        "currency": currency,
+        "transfers": transfers
+    }
+    cached = flight_cache.get(params_for_cache)
+    if cached:
+        print(f"[CACHE] Found flights in Redis for {params_for_cache}")
+        all_flights = cached
+    else:
+        print(f"[CACHE] No flights in Redis for {params_for_cache}, requesting Aviasales API...")
+        url = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
+        headers = {}
+        all_flights = []
+        date_list = []
+        if isinstance(date, dict) and "from" in date and "to" in date:
+            date_str = f"{date['from']} - {date['to']}"
+        elif isinstance(date, str):
+            date_str = date
+        else:
+            date_str = None
+        if date_str and date_str != "any":
+            match = re.match(r"(\d{4}-\d{2}-\d{2})\s*-\s*(\d{4}-\d{2}-\d{2})", date_str)
+            if match:
+                start = datetime.strptime(match.group(1), "%Y-%m-%d")
+                end = datetime.strptime(match.group(2), "%Y-%m-%d")
+                delta = (end - start).days
+                date_list = [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(delta + 1)]
+            else:
+                date_list = [d.strip() for d in re.split(r",|;| ", date_str) if re.match(r"\d{4}-\d{2}-\d{2}", d.strip())]
+                if not date_list and re.match(r"\d{4}-\d{2}", date_str):
+                    date_list = [f"{date_str}-{str(day).zfill(2)}" for day in range(1, 32)]
+                if not date_list:
+                    date_list = [date_str]
+        else:
+            date_list = [None]
+        for d in date_list:
+            params = {
+                "origin": origin,
+                "destination": destination,
+                "one_way": "true",
+                "currency": currency,
+                "token": AVIASALES_TOKEN,
+                "limit": 5,
+                "sorting": "price"
+            }
+            if d:
+                params["departure_at"] = d
+            if transfers == 0 or transfers == "0":
+                params["direct"] = "true"
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(url, params=params, headers=headers)
+                    data = resp.json()
+                    if origin == "MOW" and destination == "NHA":
+                        print(f"[DEBUG] Aviasales raw data for {d}: {data.get('data')}")
+                    if data.get("success") and data.get("data"):
+                        all_flights.extend(data["data"])
+            except Exception as e:
+                print(f"[ERROR] Ошибка при поиске билетов на дату {d}: {e}")
+        # --- Сохраняем в кэш ---
+        if all_flights:
+            flight_cache.save(params_for_cache, all_flights)
+            print(f"[CACHE] Saved {len(all_flights)} flights for {params_for_cache}")
+    if not all_flights:
+        return [], "Билеты не найдены."
+    # --- Новая логика фильтрации по пересадкам ---
+    original_flights = all_flights.copy()
+    if transfers == 0 or transfers == "0":
+        all_flights = [f for f in all_flights if f.get("transfers", 0) == 0]
+        if not all_flights:
+            if original_flights:
+                seen = set()
+                unique_flights = []
+                for f in original_flights:
+                    key = (f.get("departure_at"), f.get("origin"), f.get("destination"))
+                    if key not in seen:
+                        seen.add(key)
+                        unique_flights.append(f)
+                unique_flights.sort(key=lambda x: x.get("price", 999999))
+                flights = unique_flights[:5]
+                result = [f"✈️ Найдены билеты {origin} → {destination}"]
+                result.append("⚠️ Прямых рейсов нет, показываю варианты с пересадками")
+                if date:
+                    if isinstance(date, dict):
+                        date_info = f"{date['from']} - {date['to']}"
+                    else:
+                        date_info = date
+                    result.append(f"📅 Период: {date_info}")
+                result.append("")
+                for idx, flight in enumerate(flights, 1):
+                    price = flight.get("price")
+                    airline = flight.get("airline", "-")
+                    depart = flight.get("departure_at", "-")[:10]
+                    origin_airport = flight.get("origin_airport", origin)
+                    dest_airport = flight.get("destination_airport", destination)
+                    link = flight.get("link", "")
+                    transfers_count = flight.get("transfers", 0)
+                    formatted_price = f"{price:,}".replace(",", " ")
+                    aviasales_url = f"https://www.aviasales.com{link}"
+                    flight_card = f"{idx}. {origin} ({origin_airport}) - {destination} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
+                    flight_card += f"\n- Дата вылета: {depart} и другие."
+                    flight_card += f"\n- {airline}, {transfers_count} пересадки" if transfers_count != 1 else f"\n- {airline}, 1 пересадка"
+                    result.append(flight_card)
+                    result.append("")
+                return flights, "\n".join(result)
+            else:
+                return [], "Билеты не найдены."
+    seen = set()
+    unique_flights = []
+    for f in all_flights:
+        key = (f.get("departure_at"), f.get("origin"), f.get("destination"))
+        if key not in seen:
+            seen.add(key)
+            unique_flights.append(f)
+    unique_flights.sort(key=lambda x: x.get("price", 999999))
+    flights = unique_flights[:5]
+    result = [f"✈️ Найдены билеты {origin} → {destination}"]
+    if date:
+        if isinstance(date, dict):
+            date_info = f"{date['from']} - {date['to']}"
+        else:
+            date_info = date
+        result.append(f"📅 Период: {date_info}")
+    if transfers == 0:
+        result.append("🛫 Тип: Только прямые рейсы")
+    result.append("")
+    for idx, flight in enumerate(flights, 1):
+        price = flight.get("price")
+        airline = flight.get("airline", "-")
+        depart = flight.get("departure_at", "-")[:10]
+        origin_airport = flight.get("origin_airport", origin)
+        dest_airport = flight.get("destination_airport", destination)
+        link = flight.get("link", "")
+        transfers_count = flight.get("transfers", 0)
+        formatted_price = f"{price:,}".replace(",", " ")
+        aviasales_url = f"https://www.aviasales.com{link}"
+        flight_card = f"{idx}. {origin} ({origin_airport}) - {destination} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
+        flight_card += f"\n- Дата вылета: {depart} и другие."
+        flight_card += f"\n- {airline}, {transfers_count} пересадки" if transfers_count != 1 else f"\n- {airline}, 1 пересадка"
+        result.append(flight_card)
+        result.append("")  # Пустая строка между рейсами
+    return flights, "\n".join(result)
