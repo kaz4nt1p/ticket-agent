@@ -12,7 +12,7 @@ class AviasalesSearchTool:
         self.name = "AviasalesSearchTool"
         self.description = "Ищет авиабилеты через Aviasales API с кэшированием в Redis."
         self.api_token = os.getenv('AVIASALES_TOKEN')
-        self.base_url = "https://api.aviasales.ru"
+        self.base_url = "https://api.travelpayouts.com/aviasales"
     
     def _get_iata_code(self, city_name: str) -> Optional[str]:
         """Получает IATA код города через API Aviasales"""
@@ -21,17 +21,14 @@ class AviasalesSearchTool:
             params = {
                 'term': city_name,
                 'locale': 'ru',
-                'types[]': 'city'
+                'types[]': 'city',
+                'token': self.api_token
             }
-            
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
-            
             places = response.json()
             if places and len(places) > 0:
-                # Берем первый результат (самый релевантный)
                 return places[0].get('code')
-            
             return None
         except Exception as e:
             print(f"[IATA ERROR] Failed to get IATA code for {city_name}: {e}")
@@ -40,33 +37,21 @@ class AviasalesSearchTool:
     def _search_flights(self, params: Dict[str, Any]) -> List[Dict]:
         """Выполняет поиск рейсов через API Aviasales"""
         try:
-            # Подготавливаем параметры для API
             search_params = {
                 'origin': params.get('from'),
                 'destination': params.get('to'),
-                'depart_date': params.get('date'),
+                'departure_at': params.get('date'),
                 'currency': 'rub',
-                'market': 'ru',
-                'limit': 10
+                'limit': 10,
+                'token': self.api_token
             }
-            
-            # Добавляем фильтр по пересадкам
             if params.get('transfers') == 0:
                 search_params['direct'] = True
-            
             url = f"{self.base_url}/v3/prices_for_dates"
-            headers = {
-                'Authorization': f'Bearer {self.api_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            response = requests.get(url, params=search_params, headers=headers, timeout=30)
+            response = requests.get(url, params=search_params, timeout=30)
             response.raise_for_status()
-            
             data = response.json()
             flights = data.get('data', [])
-            
-            # Форматируем результаты
             formatted_flights = []
             for flight in flights:
                 formatted_flight = {
@@ -81,10 +66,8 @@ class AviasalesSearchTool:
                     'link': flight.get('link')
                 }
                 formatted_flights.append(formatted_flight)
-            
             print(f"[AVIASALES] Found {len(formatted_flights)} flights")
             return formatted_flights
-            
         except Exception as e:
             print(f"[AVIASALES ERROR] Failed to search flights: {e}")
             return []
