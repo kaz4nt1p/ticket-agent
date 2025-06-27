@@ -38,10 +38,12 @@ def init_db():
 
 def add_tracked_flights(chat_id: int, flights: List[Dict[str, Any]]):
     now = datetime.utcnow().isoformat()
+    print(f"[SUBSCRIBE] Добавление новых рейсов в подписку для chat_id={chat_id}: {len(flights)} рейсов")
     with _db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
         for flight in flights:
+            print(f"[SUBSCRIBE] {flight}")
             cursor.execute('''
                 INSERT INTO tracked_flights (
                     chat_id, from_city, to_city, date, flight_number, airline, departure_time, arrival_time, transfers, current_price, created_at

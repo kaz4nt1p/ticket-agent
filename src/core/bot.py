@@ -114,7 +114,11 @@ async def search_top_flights(origin: str, destination: str, date: Optional[Union
                 flights = unique_flights[:5]
                 
                 # Создаем красивый заголовок для рейсов с пересадками
-                result = [f"✈️ Найдены билеты {origin} → {destination}"]
+                origin_name = str(locals().get('origin_name', '')) if locals().get('origin_name', None) else str(origin)
+                dest_name = str(locals().get('dest_name', '')) if locals().get('dest_name', None) else str(destination)
+                _origin_name = origin_name
+                _dest_name = dest_name
+                result = [f"✈️ Найдены билеты из {_origin_name} в {_dest_name}"]
                 result.append("⚠️ Прямых рейсов нет, показываю варианты с пересадками")
                 
                 # Добавляем информацию о поиске
@@ -129,6 +133,8 @@ async def search_top_flights(origin: str, destination: str, date: Optional[Union
                 
                 # Форматируем каждый рейс
                 for idx, flight in enumerate(flights, 1):
+                    city_from = flight.get("origin_name") or origin_name or origin
+                    city_to = flight.get("destination_name") or dest_name or destination
                     price = flight.get("price")
                     airline = flight.get("airline", "-")
                     depart = flight.get("departure_at", "-")[:10]
@@ -137,8 +143,9 @@ async def search_top_flights(origin: str, destination: str, date: Optional[Union
                     link = flight.get("link", "")
                     transfers_count = flight.get("transfers", 0)
                     formatted_price = f"{price:,}".replace(",", " ")
-                    aviasales_url = f"https://www.aviasales.com{link}"
-                    flight_card = f"{idx}. {origin} ({origin_airport}) - {destination} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
+                    aviasales_url = f"https://www.aviasales.com{link}" if link else "-"
+                    # Новый формат: 1. Москва (VKO) - Алматы (ALA) от [10,364 RUB](https://...)
+                    flight_card = f"{idx}. {city_from} ({origin_airport}) - {city_to} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
                     flight_card += f"\n- Дата вылета: {depart} и другие."
                     flight_card += f"\n- {airline}, {transfers_count} пересадки" if transfers_count != 1 else f"\n- {airline}, 1 пересадка"
                     result.append(flight_card)
@@ -160,7 +167,11 @@ async def search_top_flights(origin: str, destination: str, date: Optional[Union
     flights = unique_flights[:5]
     
     # Создаем красивый заголовок
-    result = [f"✈️ Найдены билеты {origin} → {destination}"]
+    origin_name = str(locals().get('origin_name', '')) if locals().get('origin_name', None) else str(origin)
+    dest_name = str(locals().get('dest_name', '')) if locals().get('dest_name', None) else str(destination)
+    _origin_name = origin_name
+    _dest_name = dest_name
+    result = [f"✈️ Найдены билеты из {_origin_name} в {_dest_name}"]
     
     # Добавляем информацию о поиске
     if date:
@@ -177,6 +188,8 @@ async def search_top_flights(origin: str, destination: str, date: Optional[Union
     
     # Форматируем каждый рейс
     for idx, flight in enumerate(flights, 1):
+        city_from = flight.get("origin_name") or origin_name or origin
+        city_to = flight.get("destination_name") or dest_name or destination
         price = flight.get("price")
         airline = flight.get("airline", "-")
         depart = flight.get("departure_at", "-")[:10]
@@ -185,8 +198,9 @@ async def search_top_flights(origin: str, destination: str, date: Optional[Union
         link = flight.get("link", "")
         transfers_count = flight.get("transfers", 0)
         formatted_price = f"{price:,}".replace(",", " ")
-        aviasales_url = f"https://www.aviasales.com{link}"
-        flight_card = f"{idx}. {origin} ({origin_airport}) - {destination} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
+        aviasales_url = f"https://www.aviasales.com{link}" if link else "-"
+        # Новый формат: 1. Москва (VKO) - Алматы (ALA) от [10,364 RUB](https://...)
+        flight_card = f"{idx}. {city_from} ({origin_airport}) - {city_to} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
         flight_card += f"\n- Дата вылета: {depart} и другие."
         flight_card += f"\n- {airline}, {transfers_count} пересадки" if transfers_count != 1 else f"\n- {airline}, 1 пересадка"
         result.append(flight_card)
@@ -237,27 +251,32 @@ async def telegram_webhook(request: Request):
             if data_str == "track_price":
                 # Получаем flights из Redis
                 flights_json = redis_client.get(TRACK_FLIGHTS_KEY.format(chat_id))
-                if flights_json:
+                flights = None
+                if isinstance(flights_json, bytes):
+                    flights = json.loads(flights_json.decode('utf-8'))
+                elif isinstance(flights_json, str):
                     flights = json.loads(flights_json)
-                    # Преобразуем flights к нужному формату для SQLite
-                    flights_for_db = []
-                    for f in flights:
-                        flights_for_db.append({
-                            "from_city": f.get("origin"),
-                            "to_city": f.get("destination"),
-                            "date": f.get("departure_at", "")[:10],
-                            "flight_number": f.get("flight_number", f.get("airline", "") + f.get("departure_at", "")),
-                            "airline": f.get("airline"),
-                            "departure_time": f.get("departure_at"),
-                            "arrival_time": f.get("return_at", ""),
-                            "transfers": f.get("transfers"),
-                            "current_price": f.get("price")
-                        })
-                    add_tracked_flights(chat_id, flights_for_db)
-                    await send_message(chat_id, "Вы подписались на уведомления о снижении цены по этим рейсам!")
-                else:
+                # Преобразуем flights к нужному формату для SQLite
+                flights_for_db = []
+                if not isinstance(flights, list) or not flights:
                     await send_message(chat_id, "Не удалось найти рейсы для отслеживания. Попробуйте ещё раз.")
-                return {"ok": True}
+                    return {"ok": True}
+                for f in flights:
+                    flights_for_db.append({
+                        "from_city": f.get("origin"),
+                        "to_city": f.get("destination"),
+                        "date": f.get("departure_at", "")[:10],
+                        "flight_number": f.get("flight_number", f.get("airline", "") + f.get("departure_at", "")),
+                        "airline": f.get("airline"),
+                        "departure_time": f.get("departure_at"),
+                        "arrival_time": f.get("return_at", ""),
+                        "transfers": f.get("transfers"),
+                        "current_price": f.get("price")
+                    })
+                add_tracked_flights(chat_id, flights_for_db)
+                await send_message(chat_id, "Вы подписались на уведомления о снижении цены по этим рейсам!")
+            else:
+                await send_message(chat_id, "Не удалось найти рейсы для отслеживания. Попробуйте ещё раз.")
             return {"ok": True}
         # --- Обычная логика обработки сообщений ---
         chat_id = data.get("message", {}).get("chat", {}).get("id")
@@ -326,17 +345,19 @@ async def telegram_webhook(request: Request):
                 return {"ok": True}
             
             # Если у нас есть все параметры, ищем билеты
-            origin = None
-            origin_name = updated_state["from"]
-            origin_country = None
-            if not origin:
-                origin, origin_name, origin_country = await get_iata_code(updated_state["from"])
+            origin = ""
+            origin_name = updated_state["from"] if updated_state["from"] else ""
+            origin_country = ""
+            if not origin_name:
+                origin_name = ""
+            origin, origin_name, origin_country = await get_iata_code(str(updated_state["from"]))
             
-            destination = None
-            dest_name = updated_state["to"]
-            dest_country = None
-            if not destination:
-                destination, dest_name, dest_country = await get_iata_code(updated_state["to"])
+            destination = ""
+            dest_name = updated_state["to"] if updated_state["to"] else ""
+            dest_country = ""
+            if not dest_name:
+                dest_name = ""
+            destination, dest_name, dest_country = await get_iata_code(str(updated_state["to"]))
             
             # Проверяем, что IATA коды найдены
             if not origin:
@@ -391,7 +412,14 @@ async def telegram_webhook(request: Request):
                     print(f"[DATE RANGE] Converting single date to month range: {date_param}")
             
             if origin and destination:
-                flights, reply = await search_top_flights_with_flights(origin, destination, date_param, transfers=transfers_param)
+                flights, reply = await search_top_flights_with_flights(
+                    origin,
+                    destination,
+                    date_param,
+                    transfers=transfers_param,
+                    origin_name=str(origin_name) if origin_name else str(origin),
+                    dest_name=str(dest_name) if dest_name else str(destination)
+                )
             
             if reply:
                 # Если есть рейсы, отправляем с кнопкой
@@ -414,7 +442,7 @@ async def telegram_webhook(request: Request):
 
 async def send_message(chat_id: int, text: str, reply_markup: dict = None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup is not None:
+    if reply_markup:
         payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient() as client:
         await client.post(
@@ -433,7 +461,10 @@ def get_price_track_button():
     }
 
 # --- Модифицируем search_top_flights для возврата списка рейсов и текста ---
-async def search_top_flights_with_flights(origin: str, destination: str, date: Optional[Union[str, dict]] = None, currency: str = "rub", transfers: str = "any") -> tuple:
+async def search_top_flights_with_flights(origin: str, destination: str, date: Optional[Union[str, dict]] = None, currency: str = "rub", transfers: str = "any", origin_name: str = None, dest_name: str = None) -> tuple:
+    # Гарантируем, что origin_name и dest_name всегда строки
+    origin_name = str(origin_name) if origin_name else str(origin)
+    dest_name = str(dest_name) if dest_name else str(destination)
     params_for_cache = {
         "origin": origin,
         "destination": destination,
@@ -517,7 +548,11 @@ async def search_top_flights_with_flights(origin: str, destination: str, date: O
                         unique_flights.append(f)
                 unique_flights.sort(key=lambda x: x.get("price", 999999))
                 flights = unique_flights[:5]
-                result = [f"✈️ Найдены билеты {origin} → {destination}"]
+                origin_name = str(locals().get('origin_name', '')) if locals().get('origin_name', None) else str(origin)
+                dest_name = str(locals().get('dest_name', '')) if locals().get('dest_name', None) else str(destination)
+                _origin_name = origin_name
+                _dest_name = dest_name
+                result = [f"✈️ Найдены билеты из {_origin_name} в {_dest_name}"]
                 result.append("⚠️ Прямых рейсов нет, показываю варианты с пересадками")
                 if date:
                     if isinstance(date, dict):
@@ -527,6 +562,8 @@ async def search_top_flights_with_flights(origin: str, destination: str, date: O
                     result.append(f"📅 Период: {date_info}")
                 result.append("")
                 for idx, flight in enumerate(flights, 1):
+                    city_from = flight.get("origin_name") or origin_name or origin
+                    city_to = flight.get("destination_name") or dest_name or destination
                     price = flight.get("price")
                     airline = flight.get("airline", "-")
                     depart = flight.get("departure_at", "-")[:10]
@@ -535,8 +572,9 @@ async def search_top_flights_with_flights(origin: str, destination: str, date: O
                     link = flight.get("link", "")
                     transfers_count = flight.get("transfers", 0)
                     formatted_price = f"{price:,}".replace(",", " ")
-                    aviasales_url = f"https://www.aviasales.com{link}"
-                    flight_card = f"{idx}. {origin} ({origin_airport}) - {destination} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
+                    aviasales_url = f"https://www.aviasales.com{link}" if link else "-"
+                    # Новый формат: 1. Москва (VKO) - Алматы (ALA) от [10,364 RUB](https://...)
+                    flight_card = f"{idx}. {city_from} ({origin_airport}) - {city_to} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
                     flight_card += f"\n- Дата вылета: {depart} и другие."
                     flight_card += f"\n- {airline}, {transfers_count} пересадки" if transfers_count != 1 else f"\n- {airline}, 1 пересадка"
                     result.append(flight_card)
@@ -553,7 +591,11 @@ async def search_top_flights_with_flights(origin: str, destination: str, date: O
             unique_flights.append(f)
     unique_flights.sort(key=lambda x: x.get("price", 999999))
     flights = unique_flights[:5]
-    result = [f"✈️ Найдены билеты {origin} → {destination}"]
+    origin_name = str(locals().get('origin_name', '')) if locals().get('origin_name', None) else str(origin)
+    dest_name = str(locals().get('dest_name', '')) if locals().get('dest_name', None) else str(destination)
+    _origin_name = origin_name
+    _dest_name = dest_name
+    result = [f"✈️ Найдены билеты из {_origin_name} в {_dest_name}"]
     if date:
         if isinstance(date, dict):
             date_info = f"{date['from']} - {date['to']}"
@@ -564,6 +606,8 @@ async def search_top_flights_with_flights(origin: str, destination: str, date: O
         result.append("🛫 Тип: Только прямые рейсы")
     result.append("")
     for idx, flight in enumerate(flights, 1):
+        city_from = flight.get("origin_name") or origin_name or origin
+        city_to = flight.get("destination_name") or dest_name or destination
         price = flight.get("price")
         airline = flight.get("airline", "-")
         depart = flight.get("departure_at", "-")[:10]
@@ -572,8 +616,9 @@ async def search_top_flights_with_flights(origin: str, destination: str, date: O
         link = flight.get("link", "")
         transfers_count = flight.get("transfers", 0)
         formatted_price = f"{price:,}".replace(",", " ")
-        aviasales_url = f"https://www.aviasales.com{link}"
-        flight_card = f"{idx}. {origin} ({origin_airport}) - {destination} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
+        aviasales_url = f"https://www.aviasales.com{link}" if link else "-"
+        # Новый формат: 1. Москва (VKO) - Алматы (ALA) от [10,364 RUB](https://...)
+        flight_card = f"{idx}. {city_from} ({origin_airport}) - {city_to} ({dest_airport}) от [{formatted_price} {currency.upper()}]({aviasales_url})"
         flight_card += f"\n- Дата вылета: {depart} и другие."
         flight_card += f"\n- {airline}, {transfers_count} пересадки" if transfers_count != 1 else f"\n- {airline}, 1 пересадка"
         result.append(flight_card)

@@ -138,16 +138,16 @@ def run_async_job():
 
 def start_scheduler():
     scheduler = BackgroundScheduler()
-    # Каждые 3 часа
+    # Каждые 30 минут
     scheduler.add_job(
         run_async_job,
-        "interval",
-        seconds=10800,  # 3 часа
-        id="price_tracker_job",
-        replace_existing=True,
+        'interval',
+        minutes=30,  # Было hours=3
+        id='price_tracker_job',
+        replace_existing=True
     )
     scheduler.start()
-    print("[SCHEDULER] Started price tracker scheduler (interval: 3 hours)")
+    print("[SCHEDULER] Started price tracker scheduler (interval: 30 minutes)")
 
 # Для запуска вручную (например, из main.py)
 if __name__ == "__main__":
