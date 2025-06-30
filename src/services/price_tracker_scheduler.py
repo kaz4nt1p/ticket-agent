@@ -11,6 +11,7 @@ import asyncio
 import traceback
 import inspect
 import tracemalloc
+from src.core.bot import get_unsubscribe_buttons
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -22,6 +23,7 @@ def get_price_cache_key(from_city, to_city, date, flight_number):
 
 async def check_and_notify_price_drop():
     flights = get_tracked_flights()
+    print(f"[SCHEDULER] Found {len(flights)} tracked flights")
     for flight in flights:
         chat_id = flight["chat_id"]
         flight_number = flight["flight_number"]
@@ -29,6 +31,7 @@ async def check_and_notify_price_drop():
         from_city = flight["from_city"]
         to_city = flight["to_city"]
         old_price = flight["current_price"]
+        print(f"[SCHEDULER] Checking flight: {from_city}->{to_city} {date} {flight_number}, old_price={old_price}")
         cache_key = get_price_cache_key(from_city, to_city, date, flight_number)
         new_price = None
         # Проверяем кэш в Redis
@@ -39,10 +42,12 @@ async def check_and_notify_price_drop():
                 if isinstance(cached, (str, bytes)):
                     data = json.loads(cached)
                     new_price = data.get("price")
+                    print(f"[CACHE] Retrieved price: {new_price}")
                 else:
                     print(f"[CACHE ERROR] cached is not str/bytes: {type(cached)}")
                     new_price = None
-            except Exception:
+            except Exception as e:
+                print(f"[CACHE ERROR] Failed to parse cached data: {e}")
                 new_price = None
         else:
             print(f"[CACHE MISS] {cache_key}")
@@ -84,26 +89,37 @@ async def check_and_notify_price_drop():
                         data = {}
                     print(f"[DEBUG] Parsed data: {type(data)} {data if isinstance(data, dict) else str(data)[:200]}")
                     if data.get("success") and data.get("data"):
+                        # Сначала ищем точное совпадение по номеру рейса
                         for f in data["data"]:
                             if (f.get("flight_number") == flight_number or not flight_number) and f.get("departure_at", "")[:10] == date:
                                 new_price = f.get("price")
+                                print(f"[AVIASALES] Found exact match flight {f.get('flight_number')}, price: {new_price}")
                                 # Кэшируем результат
-                                redis_client.setex(cache_key, CACHE_TTL, json.dumps({"price": new_price}))
+                                redis_client.setex(cache_key, CACHE_TTL, json.dumps({"price": new_price, "link": f.get("link", "")}))
                                 break
+                        # Если точного совпадения нет, берем первый рейс с подходящей датой
+                        if new_price is None:
+                            for f in data["data"]:
+                                if f.get("departure_at", "")[:10] == date:
+                                    new_price = f.get("price")
+                                    print(f"[AVIASALES] Found flight with same date {f.get('flight_number')}, price: {new_price}")
+                                    # Кэшируем результат
+                                    redis_client.setex(cache_key, CACHE_TTL, json.dumps({"price": new_price, "link": f.get("link", "")}))
+                                    break
             except Exception as e:
                 print(f"[SCHEDULER ERROR] Unexpected exception: {e}; content={getattr(resp, 'content', None)}")
                 data = {}
+        print(f"[SCHEDULER] Final comparison: new_price={new_price}, old_price={old_price}")
         if new_price is not None and new_price < old_price:
+            print(f"[SCHEDULER] Price drop detected! Sending notification to chat_id={chat_id}")
             update_flight_price(flight["id"], new_price)
             # Формируем ссылку и детали рейса, если есть данные
-            aviasales_url = None
             airline = flight.get("airline", "-")
             depart = flight.get("departure_time", "-")[:10] if flight.get("departure_time") else date
             origin_airport = flight.get("from_city", from_city)
             dest_airport = flight.get("to_city", to_city)
             transfers_count = flight.get("transfers", 0)
             link = None
-            # Пытаемся получить ссылку из кэша Aviasales (если есть)
             if cached and isinstance(cached, (str, bytes)):
                 try:
                     data = json.loads(cached)
@@ -115,26 +131,40 @@ async def check_and_notify_price_drop():
             aviasales_url = f"https://www.aviasales.com{link}" if link else "https://www.aviasales.com"
             formatted_price = f"{new_price:,}".replace(",", " ")
             formatted_old_price = f"{old_price:,}".replace(",", " ")
-            flight_card = f"{origin_airport} - {dest_airport} от [{formatted_price} RUB]({aviasales_url})\n- Дата вылета: {depart}\n- {airline}, {transfers_count} пересадки"
+            # Цена как гиперссылка
+            price_md = f"[{formatted_price} RUB]({aviasales_url})"
+            flight_card = f"{origin_airport} - {dest_airport} от {price_md}\n- Дата вылета: {depart}\n- {airline}, {transfers_count} пересадки"
             text = f"🔥 Новый билет по вашей подписке! Цены стали ниже.\n\n{flight_card}\n\n💰 {formatted_price} руб. (было {formatted_old_price} руб.)"
-            await send_telegram_message(chat_id, text)
+            print(f"[SCHEDULER] Sending message: {text[:100]}...")
+            await send_telegram_message(chat_id, text, reply_markup=get_unsubscribe_buttons())
+            print(f"[SCHEDULER] Message sent successfully to chat_id={chat_id}")
+        else:
+            print(f"[SCHEDULER] No price drop for this flight")
 
-async def send_telegram_message(chat_id, text):
+async def send_telegram_message(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient() as client:
         await client.post(
             TELEGRAM_API_URL,
-            json={"chat_id": chat_id, "text": text}
+            json=payload
         )
 
 def run_async_job():
     # Диагностика памяти перед запуском задачи
-    snapshot1 = tracemalloc.take_snapshot()
-    asyncio.run(check_and_notify_price_drop())
-    snapshot2 = tracemalloc.take_snapshot()
-    top_stats = snapshot2.compare_to(snapshot1, 'lineno')
-    print("[TRACEMALLOC] Top 10 memory changes:")
-    for stat in top_stats[:10]:
-        print(stat)
+    try:
+        snapshot1 = tracemalloc.take_snapshot()
+        asyncio.run(check_and_notify_price_drop())
+        snapshot2 = tracemalloc.take_snapshot()
+        top_stats = snapshot2.compare_to(snapshot1, 'lineno')
+        print("[TRACEMALLOC] Top 10 memory changes:")
+        for stat in top_stats[:10]:
+            print(stat)
+    except RuntimeError:
+        # Если tracemalloc не запущен, просто выполняем задачу без диагностики
+        print("[SCHEDULER] tracemalloc not started, running job without memory diagnostics")
+        asyncio.run(check_and_notify_price_drop())
 
 def start_scheduler():
     scheduler = BackgroundScheduler()

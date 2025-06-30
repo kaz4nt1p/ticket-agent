@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  # Redis для кэширования
+  redis:
+    image: redis:7-alpine
+    container_name: flytracker_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    networks:
+      - flytracker_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Основное приложение
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flytracker_app
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - AVIASALES_TOKEN=${AVIASALES_TOKEN}
+      - DOMAIN=${DOMAIN}
+      - ENVIRONMENT=production
+      - LOG_LEVEL=INFO
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - flytracker_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx для проксирования
+  nginx:
+    image: nginx:alpine
+    container_name: flytracker_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d
+      - ./docker/ssl:/etc/nginx/ssl
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - app
+    networks:
+      - flytracker_network
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  flytracker_network:
+    driver: bridge 

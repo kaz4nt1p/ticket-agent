@@ -2,10 +2,10 @@ import sqlite3
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import threading
+import os
 
 DB_PATH = 'tracked_flights.db'
 
-# Потокобезопасный доступ к БД
 _db_lock = threading.Lock()
 
 def get_db_connection():
@@ -100,6 +100,24 @@ def find_flight(chat_id: int, flight_number: str, date: str) -> Optional[Dict[st
         row = cursor.fetchone()
         conn.close()
         return dict(row) if row else None
+
+def delete_tracked_flight(chat_id: int, flight_number: str, date: str):
+    with _db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM tracked_flights WHERE chat_id = ? AND flight_number = ? AND date = ?
+        ''', (chat_id, flight_number, date))
+        conn.commit()
+        conn.close()
+
+def delete_all_tracked_flights(chat_id: int):
+    with _db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM tracked_flights WHERE chat_id = ?', (chat_id,))
+        conn.commit()
+        conn.close()
 
 # Инициализация БД при импорте
 init_db() 

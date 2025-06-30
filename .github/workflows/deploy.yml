@@ -1,0 +1,42 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Deploy to server
+      uses: appleboy/ssh-action@v0.1.5
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USERNAME }}
+        key: ${{ secrets.SSH_KEY }}
+        port: ${{ secrets.PORT }}
+        script: |
+          # Переходим в директорию проекта
+          cd ~/fastapi-template
+          
+          # Останавливаем текущие контейнеры
+          docker-compose down
+          
+          # Обновляем код
+          git pull origin main
+          
+          # Пересобираем и запускаем
+          docker-compose up --build -d
+          
+          # Ждем запуска
+          sleep 30
+          
+          # Проверяем health check
+          curl -f http://localhost/health || exit 1
+          
+          echo "Deployment completed successfully!" 

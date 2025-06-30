@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Request
 import httpx
 import os
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict
 from dotenv import load_dotenv
 from src.core.openai_agent import extract_flight_query
 from datetime import datetime, timedelta
@@ -10,7 +10,7 @@ import re
 from src.core.dialog_memory import save_message_to_memory, get_memory
 from src.core.conversation_state import get_conversation_state
 from src.services.flight_cache import flight_cache
-from src.services.price_tracker_db import add_tracked_flights
+from src.services.price_tracker_db import add_tracked_flights, delete_tracked_flight, delete_all_tracked_flights
 import json
 from src.services.redis_client import redis_client
 
@@ -275,6 +275,41 @@ async def telegram_webhook(request: Request):
                     })
                 add_tracked_flights(chat_id, flights_for_db)
                 await send_message(chat_id, "Вы подписались на уведомления о снижении цены по этим рейсам!")
+            elif data_str == "unsubscribe_flight":
+                flights_json = redis_client.get(TRACK_FLIGHTS_KEY.format(chat_id))
+                flights = []
+                if isinstance(flights_json, bytes):
+                    try:
+                        flights = json.loads(flights_json.decode('utf-8'))
+                    except Exception:
+                        flights = []
+                elif isinstance(flights_json, str):
+                    try:
+                        flights = json.loads(flights_json)
+                    except Exception:
+                        flights = []
+                if flights and isinstance(flights, list):
+                    deleted = False
+                    for f in flights:
+                        flight_number = f.get("flight_number")
+                        if not flight_number:
+                            airline = f.get("airline", "")
+                            departure_at = f.get("departure_at", "")
+                            flight_number = airline + departure_at
+                        date_str = f.get("departure_at", "")
+                        date = date_str[:10] if date_str else ""
+                        if flight_number and date:
+                            delete_tracked_flight(chat_id, flight_number, date)
+                            deleted = True
+                    if deleted:
+                        await send_message(chat_id, "Подписка на выбранные рейсы удалена успешно.")
+                    else:
+                        await send_message(chat_id, "Не удалось найти рейсы для отмены подписки.")
+                else:
+                    await send_message(chat_id, "Не удалось найти рейсы для отмены подписки.")
+            elif data_str == "unsubscribe_all":
+                delete_all_tracked_flights(chat_id)
+                await send_message(chat_id, "Все ваши подписки удалены успешно.")
             else:
                 await send_message(chat_id, "Не удалось найти рейсы для отслеживания. Попробуйте ещё раз.")
             return {"ok": True}
@@ -425,7 +460,7 @@ async def telegram_webhook(request: Request):
                 # Если есть рейсы, отправляем с кнопкой
                 if flights:
                     redis_client.setex(TRACK_FLIGHTS_KEY.format(chat_id), 3600, json.dumps(flights, ensure_ascii=False))
-                    await send_message(chat_id, reply, reply_markup=get_price_track_button())
+                    await send_message(chat_id, reply, reply_markup=get_track_price_button())
                 else:
                     await send_message(chat_id, reply)  # reply всегда строка
                 conv_state.clear_state()
@@ -440,9 +475,9 @@ async def telegram_webhook(request: Request):
         print(f"[WEBHOOK ERROR] {e}")
     return {"ok": True}
 
-async def send_message(chat_id: int, text: str, reply_markup: dict = None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup:
+async def send_message(chat_id: int, text: Optional[str] = "", reply_markup: Optional[Dict] = None):
+    payload = {"chat_id": chat_id, "text": str(text) if text is not None else "", "parse_mode": "Markdown"}
+    if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient() as client:
         await client.post(
@@ -450,12 +485,24 @@ async def send_message(chat_id: int, text: str, reply_markup: dict = None):
             json=payload
         )
 
-# --- Новый хелпер для формирования inline-кнопки ---
-def get_price_track_button():
+# --- Новый хелпер для формирования inline-кнопок ---
+def get_track_price_button():
     return {
         "inline_keyboard": [
             [
                 {"text": "Сообщить о снижении цены 🔔", "callback_data": "track_price"}
+            ]
+        ]
+    }
+
+def get_unsubscribe_buttons():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Удалить подписку на рейс ❌", "callback_data": "unsubscribe_flight"}
+            ],
+            [
+                {"text": "Удалить все подписки ❌❌", "callback_data": "unsubscribe_all"}
             ]
         ]
     }

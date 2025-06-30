@@ -24,6 +24,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Health check endpoint для Docker
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "flytracker-bot"}
+
 # Include the bot routes
 app.include_router(bot_app, prefix="/tg")
 
